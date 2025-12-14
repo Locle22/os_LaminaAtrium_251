@@ -1,0 +1,552 @@
+================================================================================
+           PHÂN TÍCH CHI TIẾT TỪNG LỖI SYNCHRONIZATION
+================================================================================
+
+Tài liệu này giải thích TỪNG LỖI một cách chi tiết:
+- Lỗi gặp KHI NÀO
+- PHÁT HIỆN như thế nào  
+- OUTPUT SAI trông như thế nào
+- OUTPUT ĐÚNG phải như thế nào
+- NGUYÊN NHÂN gốc rễ
+- CÁCH SỬA
+
+================================================================================
+FILE INPUT MẪU ĐỂ PHÂN TÍCH
+================================================================================
+
+File: input/os_0_mlq_paging
+--------------------------
+6 2 4                          ← time_slot=6, num_cpus=2, num_processes=4
+1048576 16777216 0 0 0         ← RAM và SWAP size
+0 p0s 0                        ← Process 1: load tại slot 0, file p0s, priority 0
+2 p1s 15                       ← Process 2: load tại slot 2, file p1s, priority 15
+4 p1s 0                        ← Process 3: load tại slot 4, file p1s, priority 0
+6 p1s 0                        ← Process 4: load tại slot 6, file p1s, priority 0
+
+File: input/proc/p0s (14 lệnh, priority 1)
+------------------------------------------
+1 14
+calc
+alloc 300 0
+alloc 300 4
+free 0
+alloc 100 1
+write 100 1 20
+read 1 20 20
+...
+
+================================================================================
+LỖI 1: BARRIER SYNCHRONIZATION - TIMER
+================================================================================
+
+■ GẶP KHI NÀO?
+--------------
+Khi chạy chương trình và quan sát output trên console.
+
+■ PHÁT HIỆN NHƯ THẾ NÀO?
+------------------------
+So sánh output thực tế với expected output. Thấy thứ tự các dòng bị lộn.
+
+■ OUTPUT SAI (trước khi sửa):
+-----------------------------
+    CPU 1: Dispatched process  1       ← Dòng CPU xuất hiện TRƯỚC
+    Time slot   1                      ← Dòng Time slot xuất hiện SAU
+    liballoc:178
+    CPU 0: Put process  2 to run queue
+    Time slot   9                      ← Lại bị lộn
+
+■ OUTPUT ĐÚNG (expected):
+-------------------------
+    Time slot   1                      ← Time slot PHẢI xuất hiện TRƯỚC
+    CPU 1: Dispatched process  1       ← Rồi mới đến các hoạt động của CPU
+    Time slot   2
+    liballoc:178
+
+■ NGUYÊN NHÂN GỐC RỄ:
+---------------------
+Trong timer_routine (src/timer.c), code gốc làm theo thứ tự:
+
+    while (!timer_stop) {
+        // 1. Đánh thức CPU trước
+        pthread_cond_signal(&timer_cond);
+        
+        // 2. Tăng thời gian
+        _time++;
+        
+        // 3. In Time slot sau
+        printf("Time slot %d\n", _time);
+    }
+
+Vấn đề: CPU chạy RẤT NHANH. Ngay khi nhận signal (bước 1), CPU lập tức 
+thức dậy và in "Dispatched process". Trong khi đó Timer còn đang ở bước 2, 3.
+
+Timeline thực tế:
+    t=0.000ms: Timer gửi signal
+    t=0.001ms: CPU thức, in "Dispatched process 1"  ← CPU quá nhanh!
+    t=0.002ms: Timer in "Time slot 1"               ← Timer chậm hơn
+    
+Kết quả trên màn hình: CPU trước, Timer sau → SAI THỨ TỰ!
+
+■ CÁCH SỬA:
+-----------
+Đảo thứ tự: In Time slot TRƯỚC, rồi mới đánh thức CPU:
+
+    while (!timer_stop) {
+        // 1. Tăng thời gian
+        _time++;
+        
+        // 2. In Time slot TRƯỚC
+        printf("Time slot %d\n", _time);
+        fflush(stdout);
+        
+        // 3. Đánh thức CPU SAU
+        pthread_cond_signal(&timer_cond);
+    }
+
+Timeline sau khi sửa:
+    t=0.000ms: Timer in "Time slot 1"
+    t=0.001ms: Timer gửi signal
+    t=0.002ms: CPU thức, in "Dispatched process 1"
+    
+Kết quả: Timer trước, CPU sau → ĐÚNG THỨ TỰ!
+
+================================================================================
+LỖI 2: LOGIC ORDER SYNCHRONIZATION - LOADER
+================================================================================
+
+■ GẶP KHI NÀO?
+--------------
+Khi có process được lên lịch load tại slot > 0 (ví dụ: slot 2, 4, 6).
+
+■ PHÁT HIỆN NHƯ THẾ NÀO?
+------------------------
+Process 2 được lên lịch load tại slot 2, nhưng output cho thấy nó xuất 
+hiện sớm hơn.
+
+■ OUTPUT SAI (trước khi sửa):
+-----------------------------
+    Time slot   0
+    ld_routine
+        Loaded a process at input/proc/p0s, PID: 1 PRIO: 0
+        Loaded a process at input/proc/p1s, PID: 2 PRIO: 15  ← SAI! Load ở slot 0
+        Loaded a process at input/proc/p1s, PID: 3 PRIO: 0   ← SAI! Load ở slot 0
+        Loaded a process at input/proc/p1s, PID: 4 PRIO: 0   ← SAI! Load ở slot 0
+    Time slot   1
+    ...
+
+Tất cả 4 process đều được load ở slot 0, mặc dù schedule là slot 0, 2, 4, 6.
+
+■ OUTPUT ĐÚNG (expected):
+-------------------------
+    Time slot   0
+    ld_routine
+        Loaded a process at input/proc/p0s, PID: 1 PRIO: 0   ← Đúng slot 0
+    Time slot   1
+    ...
+    Time slot   2
+        Loaded a process at input/proc/p1s, PID: 2 PRIO: 15  ← Đúng slot 2
+    Time slot   3
+    Time slot   4
+        Loaded a process at input/proc/p1s, PID: 3 PRIO: 0   ← Đúng slot 4
+    ...
+
+■ NGUYÊN NHÂN GỐC RỄ:
+---------------------
+Code gốc trong ld_routine (src/os.c):
+
+    for (i = 0; i < num_processes; i++) {
+        // Load NGAY LẬP TỨC, không kiểm tra thời gian!
+        proc = load(path[i]);
+        printf("Loaded process PID: %d\n", proc->pid);
+        add_proc(proc);
+        
+        // Chờ SAU KHI ĐÃ LOAD
+        while (current_time() < start_time[i]) {
+            next_slot(timer_id);
+        }
+    }
+
+Vấn đề: load() được gọi TRƯỚC while loop. Nghĩa là:
+- Lần lặp 1: Load process 1 ngay (đúng vì start_time=0)
+- Lần lặp 2: Load process 2 ngay (SAI! start_time=2 nhưng chưa check)
+- Lần lặp 3: Load process 3 ngay (SAI! start_time=4)
+- Lần lặp 4: Load process 4 ngay (SAI! start_time=6)
+
+Sau đó mới chờ, nhưng lúc đó đã load hết rồi!
+
+■ CÁCH SỬA:
+-----------
+Di chuyển while loop LÊN TRƯỚC load():
+
+    for (i = 0; i < num_processes; i++) {
+        // Chờ TRƯỚC khi load
+        while (current_time() < start_time[i]) {
+            next_slot(timer_id);
+        }
+        
+        // Load SAU KHI đủ thời gian
+        proc = load(path[i]);
+        printf("Loaded process PID: %d\n", proc->pid);
+        add_proc(proc);
+    }
+
+Flow sau khi sửa:
+- Lần 1: current_time()=0 >= start_time[0]=0 → Load process 1 ✓
+- Lần 2: current_time()=0 < start_time[1]=2 → Chờ...
+         current_time()=1 < 2 → Chờ...
+         current_time()=2 >= 2 → Load process 2 ✓
+- Tương tự cho process 3, 4.
+
+================================================================================
+LỖI 3: MUTUAL EXCLUSION - SCHEDULER & MEMORY
+================================================================================
+
+■ GẶP KHI NÀO?
+--------------
+Khi có NHIỀU CPU (num_cpus >= 2) chạy song song.
+
+■ PHÁT HIỆN NHƯ THẾ NÀO?
+------------------------
+Chạy nhiều lần, kết quả khác nhau mỗi lần (non-deterministic).
+Hoặc chương trình crash với lỗi segfault.
+Hoặc process bị mất, hoặc được dispatch 2 lần.
+
+■ OUTPUT SAI (trước khi sửa):
+-----------------------------
+Chạy lần 1:
+    Time slot   7
+        CPU 0: Dispatched process  3
+        CPU 1: Dispatched process  3    ← SAI! Cùng process được dispatch 2 lần!
+
+Chạy lần 2:
+    Time slot   7
+        CPU 0: Dispatched process  3
+        CPU 1: Dispatched process  4    ← Đúng (nhưng chỉ may mắn)
+
+Chạy lần 3:
+    Segmentation fault (core dumped)    ← Crash!
+
+■ NGUYÊN NHÂN GỐC RỄ:
+---------------------
+Hai CPU cùng gọi get_proc() gần như đồng thời:
+
+    struct pcb_t* get_proc() {
+        // Không có lock!
+        struct pcb_t* proc = dequeue(&ready_queue);
+        return proc;
+    }
+
+Timeline race condition:
+    t=0: CPU0 đọc head của queue = process 3
+    t=1: CPU1 đọc head của queue = process 3 (chưa bị remove!)
+    t=2: CPU0 remove process 3 khỏi queue
+    t=3: CPU1 cố remove process 3 (đã bị remove → con trỏ sai → crash hoặc lấy nhầm)
+
+Tưởng tượng như hai người cùng lấy cái bánh cuối cùng trên đĩa:
+- Người A thấy còn 1 cái, đưa tay lấy
+- Người B cũng thấy còn 1 cái (chưa bị lấy), đưa tay lấy
+- Kết quả: tranh nhau, hoặc một người cầm đĩa rỗng
+
+■ CÁCH SỬA:
+-----------
+Thêm mutex lock:
+
+    static pthread_mutex_t queue_lock;
+    
+    struct pcb_t* get_proc() {
+        pthread_mutex_lock(&queue_lock);    // Vào phòng, khóa cửa
+        struct pcb_t* proc = dequeue(&ready_queue);
+        pthread_mutex_unlock(&queue_lock);  // Ra phòng, mở cửa
+        return proc;
+    }
+
+Timeline sau khi sửa:
+    t=0: CPU0 lock (thành công)
+    t=1: CPU1 cố lock → BLOCKED (chờ ngoài cửa)
+    t=2: CPU0 lấy process 3, unlock
+    t=3: CPU1 được lock, lấy process 4 (cái tiếp theo)
+
+================================================================================
+LỖI 4: EXECUTION ORDER SYNCHRONIZATION - CPU
+================================================================================
+
+■ GẶP KHI NÀO?
+--------------
+Khi process hết quantum (time_left = 0) và cần chuyển sang process khác.
+
+■ PHÁT HIỆN NHƯ THẾ NÀO?
+------------------------
+So sánh output: "Put process" và "Dispatched process" nằm ở khác slot.
+
+■ OUTPUT SAI (trước khi sửa - POST-CHECK):
+------------------------------------------
+    Time slot   6
+    libwrite:502
+        CPU 1: Put process  1 to run queue    ← Put ở slot 6
+    Time slot   7
+        CPU 1: Dispatched process  3          ← Dispatch ở slot 7
+
+■ OUTPUT ĐÚNG (expected - PRE-CHECK):
+-------------------------------------
+    Time slot   6
+    libwrite:502
+    Time slot   7
+        CPU 1: Put process  1 to run queue    ← Put ở slot 7
+        CPU 1: Dispatched process  3          ← Dispatch cũng ở slot 7
+
+Expected muốn Put và Dispatch nằm CÙNG MỘT SLOT.
+
+■ NGUYÊN NHÂN GỐC RỄ:
+---------------------
+Code gốc dùng POST-CHECK (kiểm tra CUỐI slot):
+
+    while (1) {
+        // Lấy process
+        if (proc == NULL) proc = get_proc();
+        
+        // Dispatch
+        printf("Dispatched process %d\n", proc->pid);
+        time_left = quantum;
+        
+        // Chạy
+        run(proc);
+        time_left--;
+        
+        // POST-CHECK: Kiểm tra ở CUỐI slot
+        if (time_left == 0) {
+            printf("Put process %d\n", proc->pid);  ← In ngay, còn ở slot cũ
+            put_proc(proc);
+            proc = NULL;
+        }
+        
+        next_slot();  ← Sau đó mới chuyển slot
+    }
+
+Flow với POST-CHECK:
+    Slot 6: run() → time_left=0 → "Put process 1" → next_slot()
+    Slot 7: get_proc() → "Dispatched process 3"
+
+Kết quả: "Put" ở slot 6, "Dispatched" ở slot 7.
+
+■ CÁCH SỬA:
+-----------
+Chuyển sang PRE-CHECK (kiểm tra ĐẦU slot):
+
+    while (1) {
+        // PRE-CHECK: Kiểm tra ở ĐẦU slot
+        if (proc != NULL && time_left == 0) {
+            printf("Put process %d\n", proc->pid);
+            put_proc(proc);
+            proc = NULL;
+        }
+        
+        // Lấy process mới
+        if (proc == NULL) proc = get_proc();
+        
+        // Dispatch
+        printf("Dispatched process %d\n", proc->pid);
+        time_left = quantum;
+        
+        // Chạy
+        run(proc);
+        time_left--;
+        
+        next_slot();
+    }
+
+Flow với PRE-CHECK:
+    Slot 6: run() → time_left=0 → next_slot()
+    Slot 7: PRE-CHECK → "Put process 1" → get_proc() → "Dispatched process 3"
+
+Kết quả: Cả "Put" và "Dispatched" đều ở slot 7.
+
+================================================================================
+LỖI 5: ADDRESS SPACE ISOLATION - PROCESS MEMORY
+================================================================================
+
+■ GẶP KHI NÀO?
+--------------
+Khi có nhiều process chạy các lệnh memory (alloc, write, read).
+
+■ PHÁT HIỆN NHƯ THẾ NÀO?
+------------------------
+- Kết quả read() sai (đọc được giá trị của process khác)
+- print_pgtbl không in gì hoặc in sai
+- Crash do truy cập memory không hợp lệ
+
+■ OUTPUT SAI (trước khi sửa):
+-----------------------------
+    Time slot   2
+    liballoc:178
+    print_pgtbl:                           ← KHÔNG có PDG=, P4g=,... 
+    
+    Time slot   5
+    liballoc:178
+    print_pgtbl:                           ← Vẫn trống!
+
+    (Hoặc)
+    Process 1 write 100 vào địa chỉ X
+    Process 2 read từ địa chỉ X → được 100  ← SAI! Process 2 không nên thấy data của Process 1
+
+■ OUTPUT ĐÚNG (expected):
+-------------------------
+    Time slot   2
+    liballoc:178
+    print_pgtbl:
+     PDG=0x... P4g=0x... PUD=0x... PMD=0x...   ← Có đầy đủ thông tin page table
+
+■ NGUYÊN NHÂN GỐC RỄ:
+---------------------
+Code gốc dùng CHUNG một mm_struct cho tất cả process:
+
+    // Trong kernel
+    struct mm_struct *global_mm;  // Một cái duy nhất
+    
+    // Khi load process
+    proc->krnl->mm = global_mm;   // Tất cả trỏ đến cùng một chỗ!
+
+Hậu quả:
+- Process 1 alloc → ghi vào global_mm->page_table
+- Process 2 alloc → GHI ĐÈ lên global_mm->page_table
+- Process 1 read → đọc từ page_table đã bị Process 2 ghi đè → SAI!
+
+Thêm nữa, với vm_freerg_list ban đầu chứa toàn bộ không gian địa chỉ:
+- __alloc() luôn tìm được vùng trống từ free list
+- KHÔNG gọi syscall để map physical pages
+- sbrk vẫn = 0
+- print_pgtbl(0, sbrk=0) không in gì vì không có vùng nào để in
+
+■ CÁCH SỬA:
+-----------
+Mỗi process có mm_struct RIÊNG:
+
+    // Thêm vào struct pcb_t
+    struct pcb_t {
+        ...
+        struct mm_struct *mm;  // Riêng cho mỗi process
+    };
+    
+    // Khi load process
+    proc->mm = malloc(sizeof(struct mm_struct));
+    init_mm(proc->mm, proc);
+    
+    // KHÔNG khởi tạo vm_freerg_list với toàn bộ không gian
+    proc->mm->vm_freerg_list = NULL;
+
+Flow sau khi sửa:
+- Process 1 alloc → ghi vào proc1->mm (riêng)
+- Process 2 alloc → ghi vào proc2->mm (riêng)
+- Không ghi đè lẫn nhau!
+
+- __alloc() không tìm được từ free list (vì NULL)
+- Gọi syscall để map physical pages
+- sbrk được cập nhật
+- print_pgtbl in đúng thông tin
+
+================================================================================
+LỖI 6: OUTPUT STREAM SYNCHRONIZATION - CONSOLE BUFFER
+================================================================================
+
+■ GẶP KHI NÀO?
+--------------
+Bất cứ khi nào có nhiều thread cùng printf.
+
+■ PHÁT HIỆN NHƯ THẾ NÀO?
+------------------------
+Output đôi khi bị lẫn lộn, không theo thứ tự thực thi.
+Hoặc một số dòng xuất hiện muộn hơn dự kiến.
+
+■ OUTPUT SAI (trước khi sửa):
+-----------------------------
+Chạy lần 1:
+    Time slot   5
+    CPU 0: Dispatched process  2
+    liballoc:178
+
+Chạy lần 2:
+    Time slot   5
+    liballoc:178
+    CPU 0: Dispatched process  2     ← Thứ tự khác!
+
+Chạy lần 3:
+    Time slot   5
+    CPU 0: DispatchedTime slot   6   ← Bị cắt ngang giữa chừng!
+     process  2
+
+■ NGUYÊN NHÂN GỐC RỄ:
+---------------------
+printf() KHÔNG in ra màn hình ngay. Nó lưu vào buffer trước:
+
+    Buffer của Thread A: "Time slot 5\n"
+    Buffer của Thread B: "Dispatched process 2\n"
+
+Buffer được flush (in ra) khi:
+1. Buffer đầy
+2. Gặp '\n' (tùy hệ thống)
+3. Gọi fflush()
+4. Chương trình kết thúc
+
+Trong multi-thread, thứ tự flush không đảm bảo:
+    t=0: Thread A printf("Time slot 5") → vào buffer A
+    t=1: Thread B printf("Dispatched") → vào buffer B
+    t=2: Buffer B flush trước (do OS schedule) → "Dispatched" hiện trước
+    t=3: Buffer A flush sau → "Time slot 5" hiện sau
+
+■ CÁCH SỬA:
+-----------
+Thêm fflush() sau mỗi printf:
+
+    printf("Time slot %d\n", time);
+    fflush(stdout);  // Ép in ra ngay!
+    
+    printf("Dispatched process %d\n", pid);
+    fflush(stdout);  // Ép in ra ngay!
+
+Sau khi sửa:
+    t=0: Thread A printf + fflush → "Time slot 5" IN NGAY
+    t=1: Thread B printf + fflush → "Dispatched" IN NGAY
+    
+Thứ tự trên màn hình = thứ tự thực thi.
+
+================================================================================
+TỔNG KẾT
+================================================================================
+
+┌─────┬──────────────────────────────┬────────────────────────────────────────┐
+│ Lỗi │ Tên                          │ Triệu chứng                            │
+├─────┼──────────────────────────────┼────────────────────────────────────────┤
+│  1  │ Barrier (Timer)              │ "Time slot" in SAU các hoạt động CPU   │
+├─────┼──────────────────────────────┼────────────────────────────────────────┤
+│  2  │ Logic Order (Loader)         │ Process load SỚM hơn thời gian quy định│
+├─────┼──────────────────────────────┼────────────────────────────────────────┤
+│  3  │ Mutual Exclusion (Queue/Mem) │ Crash, hoặc process bị dispatch 2 lần  │
+├─────┼──────────────────────────────┼────────────────────────────────────────┤
+│  4  │ Execution Order (CPU)        │ Put và Dispatch ở khác slot            │
+├─────┼──────────────────────────────┼────────────────────────────────────────┤
+│  5  │ Address Space (Memory)       │ print_pgtbl trống, data bị ghi đè      │
+├─────┼──────────────────────────────┼────────────────────────────────────────┤
+│  6  │ Output Stream (Buffer)       │ Output lẫn lộn mỗi lần chạy khác nhau  │
+└─────┴──────────────────────────────┴────────────────────────────────────────┘
+
+================================================================================
+CÁCH DEBUG RACE CONDITION
+================================================================================
+
+1. CHẠY NHIỀU LẦN: Race condition không phải lúc nào cũng xảy ra.
+   Chạy 10-20 lần, nếu kết quả khác nhau → có race condition.
+
+2. THÊM SLEEP: Thêm usleep(1000) vào các vị trí nghi ngờ để làm chậm
+   thread và "phóng đại" race condition.
+
+3. SO SÁNH VỚI EXPECTED: Nếu output khác expected và khác nhau mỗi lần
+   → race condition trong hiển thị (Lỗi 1, 6).
+
+4. QUAN SÁT CRASH: Nếu crash ngẫu nhiên → race condition trong data
+   structure (Lỗi 3).
+
+5. KIỂM TRA GIÁ TRỊ: Nếu process đọc được giá trị của process khác
+   → không có isolation (Lỗi 5).
+
+================================================================================
+                                   HẾT
+================================================================================
