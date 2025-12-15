@@ -1,4 +1,4 @@
-# OS Simulation - LamiaAtrium (Course 251)
+# OS Simulation - LamiaAtrium
 
 Dự án mô phỏng Hệ điều hành (Operating System Simulator) được phát triển dựa trên khung chương trình của môn Hệ điều hành (Course 251 - HCMUT). Dự án tập trung vào việc hiện thực hóa các thành phần cốt lõi như Lập lịch (Scheduler), Quản lý bộ nhớ (Memory Management) và Đồng bộ hóa (Synchronization).
 
